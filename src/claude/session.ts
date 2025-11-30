@@ -58,6 +58,14 @@ export interface ClaudeResult {
 }
 
 /**
+ * Callback for tool execution progress
+ */
+export type OnToolUseCallback = (
+  toolName: string,
+  toolInput: Record<string, unknown>
+) => void | Promise<void>;
+
+/**
  * Session manager options
  */
 export interface SessionManagerOptions {
@@ -281,7 +289,10 @@ export class SessionManager {
   async query(
     chatId: number,
     prompt: string,
-    onProgress?: (text: string) => void
+    callbacks?: {
+      onProgress?: (text: string) => void;
+      onToolUse?: OnToolUseCallback;
+    }
   ): Promise<ClaudeResult> {
     const session = this.getSession(chatId);
     const startTime = Date.now();
@@ -327,16 +338,20 @@ export class SessionManager {
         this.processMessage(message, {
           onText: (text) => {
             resultText += text;
-            if (onProgress) {
-              onProgress(text);
+            if (callbacks?.onProgress) {
+              callbacks.onProgress(text);
             }
           },
           onSessionId: (id) => {
             newSessionId = id;
           },
-          onToolUse: (tool) => {
+          onToolUse: (tool, input) => {
             if (!toolsUsed.includes(tool)) {
               toolsUsed.push(tool);
+            }
+            // Trigger the onToolUse callback if provided
+            if (callbacks?.onToolUse) {
+              callbacks.onToolUse(tool, input);
             }
           },
           onCost: (cost) => {
@@ -382,7 +397,7 @@ export class SessionManager {
     handlers: {
       onText: (text: string) => void;
       onSessionId: (id: string) => void;
-      onToolUse: (tool: string) => void;
+      onToolUse: (tool: string, input: Record<string, unknown>) => void;
       onCost: (cost: number) => void;
     }
   ): void {
@@ -409,7 +424,9 @@ export class SessionManager {
               if (block.type === 'text') {
                 handlers.onText(block.text);
               } else if (block.type === 'tool_use') {
-                handlers.onToolUse(block.name);
+                // Pass tool name and input to the handler
+                const toolInput = (block as { name: string; input: Record<string, unknown> }).input || {};
+                handlers.onToolUse(block.name, toolInput);
               }
             }
           }

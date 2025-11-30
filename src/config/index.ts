@@ -32,6 +32,10 @@ export interface BotConfig {
   systemPromptFile?: string;
   /** Path to MCP configuration file (.mcp.json) */
   mcpConfigFile?: string;
+  /** Enable progress updates using Claude Haiku (default: true) */
+  progressEnabled?: boolean;
+  /** Custom system prompt for progress description generation */
+  progressSystemPrompt?: string;
 }
 
 /**
@@ -193,6 +197,13 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     }
   }
 
+  // Progress updates enabled (default: true)
+  const progressEnabledEnv = process.env[`${prefix}_PROGRESS_ENABLED`];
+  const progressEnabled = progressEnabledEnv !== 'false';
+
+  // Custom system prompt for progress descriptions (optional)
+  const progressSystemPrompt = process.env[`${prefix}_PROGRESS_SYSTEM_PROMPT`];
+
   return {
     token,
     workingDir,
@@ -206,6 +217,8 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     permissionTimeout,
     systemPromptFile,
     mcpConfigFile,
+    progressEnabled,
+    progressSystemPrompt,
   };
 }
 

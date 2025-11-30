@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as https from 'https';
 import { getLogger } from '../logger';
 import { SessionManager } from '../claude/session';
+import { ProgressDescriber } from '../claude/progress';
 import { SQLiteStorage } from '../storage/sqlite';
 import { BotConfig } from '../config';
 
@@ -153,6 +154,7 @@ function splitMessage(text: string, maxLength: number = MAX_MESSAGE_LENGTH): str
 export class TelegramBot {
   private bot: Telegraf;
   private sessionManager: SessionManager;
+  private progressDescriber: ProgressDescriber;
   private config: BotConfig;
   private logger = getLogger();
   private isRunning = false;
@@ -160,6 +162,9 @@ export class TelegramBot {
   // Message queue per chat to prevent concurrent processing
   private messageQueues: Map<number, QueueItem[]> = new Map();
   private processingChats: Set<number> = new Set();
+
+  // Minimum interval between progress message edits (ms)
+  private readonly PROGRESS_UPDATE_INTERVAL = 1500;
 
   constructor(config: BotConfig, storage: SQLiteStorage) {
     this.config = config;
@@ -169,6 +174,12 @@ export class TelegramBot {
         agent: new https.Agent({ keepAlive: true, family: 4 }),
       },
     });
+
+    // Initialize progress describer (uses Agent SDK with Haiku model)
+    this.progressDescriber = new ProgressDescriber(
+      config.progressEnabled !== false, // Enable by default
+      config.progressSystemPrompt
+    );
 
     this.sessionManager = new SessionManager({
       storage,
@@ -714,12 +725,65 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       }
     }, 4000);
 
+    // Progress message tracking
+    let progressMessageId: number | undefined;
+    let lastProgressUpdate = 0;
+    let toolCount = 0;
+
+    // Send initial progress message
     try {
-      // Query Claude
-      const result = await this.sessionManager.query(chatId, text);
+      const progressMsg = await ctx.reply('🔄 處理中...');
+      progressMessageId = progressMsg.message_id;
+    } catch {
+      // Ignore if we can't send progress message
+    }
+
+    // Helper to update progress message with debounce
+    const updateProgress = async (description: string) => {
+      if (!progressMessageId) return;
+
+      const now = Date.now();
+      if (now - lastProgressUpdate < this.PROGRESS_UPDATE_INTERVAL) {
+        return; // Debounce - skip update if too frequent
+      }
+      lastProgressUpdate = now;
+
+      try {
+        await this.bot.telegram.editMessageText(
+          chatId,
+          progressMessageId,
+          undefined,
+          `🔧 ${description}`
+        );
+      } catch {
+        // Ignore edit errors (message not modified, etc.)
+      }
+    };
+
+    try {
+      // Query Claude with progress callback
+      const result = await this.sessionManager.query(chatId, text, {
+        onToolUse: async (toolName, toolInput) => {
+          toolCount++;
+          this.logger.debug('Tool use detected', { chatId, toolName, toolCount });
+
+          // Generate human-friendly description using Haiku
+          const description = await this.progressDescriber.describe(toolName, toolInput);
+          await updateProgress(description);
+        },
+      });
 
       // Clear typing indicator
       clearInterval(typingInterval);
+
+      // Delete progress message before sending response
+      if (progressMessageId) {
+        try {
+          await this.bot.telegram.deleteMessage(chatId, progressMessageId);
+        } catch {
+          // Ignore delete errors
+        }
+      }
 
       // Send the response
       if (result.text) {
@@ -733,11 +797,22 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
         chatId,
         responseLength: result.text.length,
         toolsUsed: result.toolsUsed,
+        toolCount,
         durationMs: result.durationMs,
         costUsd: result.costUsd,
       });
     } catch (error) {
       clearInterval(typingInterval);
+
+      // Delete progress message on error
+      if (progressMessageId) {
+        try {
+          await this.bot.telegram.deleteMessage(chatId, progressMessageId);
+        } catch {
+          // Ignore delete errors
+        }
+      }
+
       this.logger.error('Error processing message', { chatId, error });
 
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
