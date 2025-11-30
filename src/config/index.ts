@@ -28,6 +28,10 @@ export interface BotConfig {
   permissionMode: PermissionMode;
   /** Timeout for permission requests in seconds (default: 60) */
   permissionTimeout: number;
+  /** Path to custom system prompt file (optional) */
+  systemPromptFile?: string;
+  /** Path to MCP configuration file (.mcp.json) */
+  mcpConfigFile?: string;
 }
 
 /**
@@ -159,16 +163,35 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
   const maxTurnsStr = process.env[`${prefix}_MAX_TURNS`];
   const maxTurns = maxTurnsStr ? parseInt(maxTurnsStr, 10) : 50;
 
-  // Permission mode (default: bypassPermissions)
-  const permissionModeEnv = process.env[`${prefix}_PERMISSION_MODE`] || 'bypassPermissions';
+  // Permission mode (default: default - requires user confirmation)
+  const permissionModeEnv = process.env[`${prefix}_PERMISSION_MODE`] || 'default';
   const validModes: PermissionMode[] = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
   const permissionMode: PermissionMode = validModes.includes(permissionModeEnv as PermissionMode)
     ? (permissionModeEnv as PermissionMode)
-    : 'bypassPermissions';
+    : 'default';
 
   // Permission timeout in seconds (default: 60)
   const permissionTimeoutStr = process.env[`${prefix}_PERMISSION_TIMEOUT`];
   const permissionTimeout = permissionTimeoutStr ? parseInt(permissionTimeoutStr, 10) : 60;
+
+  // System prompt file (optional)
+  const systemPromptFile = process.env[`${prefix}_SYSTEM_PROMPT_FILE`];
+  if (systemPromptFile && !fs.existsSync(systemPromptFile)) {
+    throw new Error(`System prompt file not found: ${systemPromptFile}`);
+  }
+
+  // MCP config file: explicit path or auto-detect in workingDir
+  let mcpConfigFile = process.env[`${prefix}_MCP_CONFIG_FILE`];
+  if (mcpConfigFile && !fs.existsSync(mcpConfigFile)) {
+    throw new Error(`MCP config file not found: ${mcpConfigFile}`);
+  }
+  // Auto-detect .mcp.json in workingDir if not explicitly specified
+  if (!mcpConfigFile) {
+    const autoDetectPath = path.join(workingDir, '.mcp.json');
+    if (fs.existsSync(autoDetectPath)) {
+      mcpConfigFile = autoDetectPath;
+    }
+  }
 
   return {
     token,
@@ -181,6 +204,8 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     maxTurns,
     permissionMode,
     permissionTimeout,
+    systemPromptFile,
+    mcpConfigFile,
   };
 }
 

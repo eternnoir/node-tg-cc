@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import {
   query,
   type SDKMessage,
@@ -5,11 +6,36 @@ import {
   type SDKSystemMessage,
   type SDKResultMessage,
   type Options,
+  type McpServerConfig,
 } from '@anthropic-ai/claude-agent-sdk';
 import { getLogger } from '../logger';
 import { SQLiteStorage } from '../storage/sqlite';
 import { PermissionManager, type PermissionRequestCallback } from './permission';
 import { type PermissionMode } from '../config';
+
+/**
+ * MCP configuration file structure
+ */
+interface McpConfigFile {
+  mcpServers?: Record<string, McpServerConfig>;
+}
+
+/**
+ * Load MCP configuration from a JSON file
+ */
+function loadMcpConfig(
+  filePath: string,
+  logger: ReturnType<typeof getLogger>
+): Record<string, McpServerConfig> | undefined {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const config: McpConfigFile = JSON.parse(content);
+    return config.mcpServers;
+  } catch (error) {
+    logger.warn('Failed to load MCP config', { filePath, error });
+    return undefined;
+  }
+}
 
 /**
  * Claude session for a specific chat
@@ -43,6 +69,8 @@ export interface SessionManagerOptions {
   claudeArgs?: string[];
   permissionMode?: PermissionMode;
   permissionTimeout?: number;
+  systemPromptFile?: string;
+  mcpConfigFile?: string;
 }
 
 /**
@@ -59,6 +87,8 @@ export class SessionManager {
   private claudeArgs: string[];
   private permissionMode: PermissionMode;
   private permissionManager: PermissionManager;
+  private systemPrompt?: string;
+  private mcpServers?: Record<string, McpServerConfig>;
 
   constructor(options: SessionManagerOptions) {
     this.storage = options.storage;
@@ -67,8 +97,30 @@ export class SessionManager {
     this.model = options.model || 'sonnet';
     this.maxTurns = options.maxTurns || 50;
     this.claudeArgs = options.claudeArgs || [];
-    this.permissionMode = options.permissionMode || 'bypassPermissions';
+    this.permissionMode = options.permissionMode || 'default';
     this.permissionManager = new PermissionManager(options.permissionTimeout || 60);
+
+    // Load system prompt from file if specified
+    if (options.systemPromptFile) {
+      this.systemPrompt = fs.readFileSync(options.systemPromptFile, 'utf-8');
+      this.logger.info('Loaded custom system prompt', {
+        botName: this.botName,
+        file: options.systemPromptFile,
+        length: this.systemPrompt.length,
+      });
+    }
+
+    // Load MCP configuration if specified
+    if (options.mcpConfigFile) {
+      this.mcpServers = loadMcpConfig(options.mcpConfigFile, this.logger);
+      if (this.mcpServers) {
+        this.logger.info('Loaded MCP config', {
+          botName: this.botName,
+          file: options.mcpConfigFile,
+          servers: Object.keys(this.mcpServers),
+        });
+      }
+    }
 
     this.logger.info('SessionManager initialized', {
       botName: this.botName,
@@ -77,6 +129,8 @@ export class SessionManager {
       maxTurns: this.maxTurns,
       permissionMode: this.permissionMode,
       claudeArgs: this.claudeArgs,
+      hasSystemPrompt: !!this.systemPrompt,
+      hasMcpServers: !!this.mcpServers,
     });
   }
 
@@ -251,6 +305,8 @@ export class SessionManager {
         maxTurns: this.maxTurns,
         permissionMode: this.permissionMode,
         ...this.parseClaudeOptions(),
+        ...(this.systemPrompt && { systemPrompt: this.systemPrompt }),
+        ...(this.mcpServers && { mcpServers: this.mcpServers }),
       };
 
       // Add canUseTool callback if permission mode requires it

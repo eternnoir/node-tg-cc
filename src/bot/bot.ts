@@ -2,6 +2,7 @@ import { Telegraf, Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as https from 'https';
 import { getLogger } from '../logger';
 import { SessionManager } from '../claude/session';
 import { SQLiteStorage } from '../storage/sqlite';
@@ -9,6 +10,15 @@ import { BotConfig } from '../config';
 
 // Telegram message character limit
 const MAX_MESSAGE_LENGTH = 4096;
+
+/**
+ * Message queue item
+ */
+interface QueueItem {
+  ctx: Context;
+  text: string;
+  resolve: () => void;
+}
 
 /**
  * Format tool input for display
@@ -147,9 +157,18 @@ export class TelegramBot {
   private logger = getLogger();
   private isRunning = false;
 
+  // Message queue per chat to prevent concurrent processing
+  private messageQueues: Map<number, QueueItem[]> = new Map();
+  private processingChats: Set<number> = new Set();
+
   constructor(config: BotConfig, storage: SQLiteStorage) {
     this.config = config;
-    this.bot = new Telegraf(config.token);
+    // Force IPv4 to avoid connectivity issues with IPv6
+    this.bot = new Telegraf(config.token, {
+      telegram: {
+        agent: new https.Agent({ keepAlive: true, family: 4 }),
+      },
+    });
 
     this.sessionManager = new SessionManager({
       storage,
@@ -160,6 +179,8 @@ export class TelegramBot {
       claudeArgs: config.claudeArgs,
       permissionMode: config.permissionMode,
       permissionTimeout: config.permissionTimeout,
+      systemPromptFile: config.systemPromptFile,
+      mcpConfigFile: config.mcpConfigFile,
     });
 
     // Set up permission request callback
@@ -167,9 +188,20 @@ export class TelegramBot {
       this.sendPermissionRequest.bind(this)
     );
 
+    // Debug: Log all callback queries (must be before setupCallbackHandler)
+    this.bot.on('callback_query', (ctx, next) => {
+      this.logger.info('Callback query received (raw)', {
+        data: ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined,
+        chatId: ctx.chat?.id,
+        userId: ctx.from?.id,
+      });
+      return next();
+    });
+
     this.setupCommands();
     this.setupMessageHandler();
     this.setupCallbackHandler();
+    this.setupErrorHandler();
 
     this.logger.info('TelegramBot initialized', {
       botName: config.name,
@@ -238,13 +270,34 @@ Do you want to allow this action?`;
       const action = match[1];
       const permissionId = match[2];
 
+      this.logger.info('Permission callback received', {
+        action,
+        permissionId,
+        chatId: ctx.chat?.id,
+        userId: ctx.from?.id,
+      });
+
       const permissionManager = this.sessionManager.getPermissionManager();
       const pending = permissionManager.getPendingPermission(permissionId);
 
       if (!pending) {
         await ctx.answerCbQuery('This permission request has expired.');
-        await ctx.editMessageText('⏰ Permission request expired or already handled.');
+        try {
+          await ctx.editMessageText('⏰ Permission request expired or already handled.');
+        } catch {
+          // Ignore edit errors for expired messages
+        }
         return;
+      }
+
+      // Immediately update message to processing state to prevent duplicate clicks
+      try {
+        await ctx.editMessageText(
+          `⏳ Processing...\n\nTool: \`${pending.toolName}\``,
+          { parse_mode: 'Markdown' }
+        );
+      } catch {
+        // Ignore edit errors, continue processing
       }
 
       let response: { allowed: boolean; alwaysAllow?: boolean; message?: string };
@@ -266,18 +319,43 @@ Do you want to allow this action?`;
           break;
       }
 
-      // Resolve the permission
+      // Resolve the permission - this must always execute
       const resolved = permissionManager.resolvePermission(permissionId, response);
 
-      if (resolved) {
-        await ctx.answerCbQuery(statusMessage);
-        await ctx.editMessageText(
-          `${statusMessage}\n\nTool: \`${pending.toolName}\``,
-          { parse_mode: 'Markdown' }
-        );
-      } else {
-        await ctx.answerCbQuery('Failed to process permission.');
+      this.logger.info('Permission resolved', {
+        permissionId,
+        action,
+        resolved,
+        toolName: pending.toolName,
+      });
+
+      try {
+        if (resolved) {
+          await ctx.answerCbQuery(statusMessage);
+          await ctx.editMessageText(
+            `${statusMessage}\n\nTool: \`${pending.toolName}\``,
+            { parse_mode: 'Markdown' }
+          );
+        } else {
+          await ctx.answerCbQuery('Failed to process permission.');
+        }
+      } catch {
+        // Ignore UI update errors, permission was already resolved
       }
+    });
+  }
+
+  /**
+   * Setup global error handler for Telegraf
+   */
+  private setupErrorHandler(): void {
+    this.bot.catch((err, ctx) => {
+      this.logger.error('Telegraf error', {
+        error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+        updateType: ctx.updateType,
+        chatId: ctx.chat?.id,
+        userId: ctx.from?.id,
+      });
     });
   }
 
@@ -430,65 +508,158 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
 
   /**
    * Setup message handler for text and files
+   * NOTE: Handlers use message queue to ensure sequential processing per chat,
+   * while not blocking Telegraf polling (allowing callback_query to be received).
    */
   private setupMessageHandler(): void {
-    // Handle text messages
-    this.bot.on(message('text'), async (ctx) => {
-      await this.handleMessage(ctx, ctx.message.text);
+    // Handle text messages (enqueue for sequential processing)
+    this.bot.on(message('text'), (ctx) => {
+      this.enqueueMessage(ctx, ctx.message.text);
     });
 
-    // Handle photos
-    this.bot.on(message('photo'), async (ctx) => {
-      const photo = ctx.message.photo[ctx.message.photo.length - 1];
-      const filePath = await this.downloadFile(ctx, photo.file_id, 'photo.jpg');
-      const caption = ctx.message.caption || 'Please analyze this image.';
-      await this.handleMessage(ctx, `${caption}\n\nImage file: ${filePath}`);
+    // Handle photos (download first, then enqueue)
+    this.bot.on(message('photo'), (ctx) => {
+      (async () => {
+        const photo = ctx.message.photo[ctx.message.photo.length - 1];
+        const filePath = await this.downloadFile(ctx, photo.file_id, 'photo.jpg');
+        const caption = ctx.message.caption || 'Please analyze this image.';
+        this.enqueueMessage(ctx, `${caption}\n\nImage file: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading photo', { error, chatId: ctx.chat?.id });
+      });
     });
 
-    // Handle documents
-    this.bot.on(message('document'), async (ctx) => {
-      const doc = ctx.message.document;
-      const fileName = doc.file_name || 'document';
-      const filePath = await this.downloadFile(ctx, doc.file_id, fileName);
-      const caption = ctx.message.caption || `Please analyze this file: ${fileName}`;
-      await this.handleMessage(ctx, `${caption}\n\nFile: ${filePath}`);
+    // Handle documents (download first, then enqueue)
+    this.bot.on(message('document'), (ctx) => {
+      (async () => {
+        const doc = ctx.message.document;
+        const fileName = doc.file_name || 'document';
+        const filePath = await this.downloadFile(ctx, doc.file_id, fileName);
+        const caption = ctx.message.caption || `Please analyze this file: ${fileName}`;
+        this.enqueueMessage(ctx, `${caption}\n\nFile: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading document', { error, chatId: ctx.chat?.id });
+      });
     });
 
-    // Handle audio
-    this.bot.on(message('audio'), async (ctx) => {
-      const audio = ctx.message.audio;
-      const fileName = audio.file_name || 'audio.mp3';
-      const filePath = await this.downloadFile(ctx, audio.file_id, fileName);
-      const caption = ctx.message.caption || 'Please analyze this audio file.';
-      await this.handleMessage(ctx, `${caption}\n\nAudio file: ${filePath}`);
+    // Handle audio (download first, then enqueue)
+    this.bot.on(message('audio'), (ctx) => {
+      (async () => {
+        const audio = ctx.message.audio;
+        const fileName = audio.file_name || 'audio.mp3';
+        const filePath = await this.downloadFile(ctx, audio.file_id, fileName);
+        const caption = ctx.message.caption || 'Please analyze this audio file.';
+        this.enqueueMessage(ctx, `${caption}\n\nAudio file: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading audio', { error, chatId: ctx.chat?.id });
+      });
     });
 
-    // Handle video
-    this.bot.on(message('video'), async (ctx) => {
-      const video = ctx.message.video;
-      const fileName = video.file_name || 'video.mp4';
-      const filePath = await this.downloadFile(ctx, video.file_id, fileName);
-      const caption = ctx.message.caption || 'Please analyze this video file.';
-      await this.handleMessage(ctx, `${caption}\n\nVideo file: ${filePath}`);
+    // Handle video (download first, then enqueue)
+    this.bot.on(message('video'), (ctx) => {
+      (async () => {
+        const video = ctx.message.video;
+        const fileName = video.file_name || 'video.mp4';
+        const filePath = await this.downloadFile(ctx, video.file_id, fileName);
+        const caption = ctx.message.caption || 'Please analyze this video file.';
+        this.enqueueMessage(ctx, `${caption}\n\nVideo file: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading video', { error, chatId: ctx.chat?.id });
+      });
     });
 
-    // Handle voice messages
-    this.bot.on(message('voice'), async (ctx) => {
-      const voice = ctx.message.voice;
-      const filePath = await this.downloadFile(ctx, voice.file_id, 'voice.ogg');
-      await this.handleMessage(ctx, `Please analyze this voice message.\n\nVoice file: ${filePath}`);
+    // Handle voice messages (download first, then enqueue)
+    this.bot.on(message('voice'), (ctx) => {
+      (async () => {
+        const voice = ctx.message.voice;
+        const filePath = await this.downloadFile(ctx, voice.file_id, 'voice.ogg');
+        this.enqueueMessage(ctx, `Please analyze this voice message.\n\nVoice file: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading voice', { error, chatId: ctx.chat?.id });
+      });
     });
 
-    // Handle stickers
-    this.bot.on(message('sticker'), async (ctx) => {
-      const sticker = ctx.message.sticker;
-      if (sticker.is_animated || sticker.is_video) {
-        await ctx.reply('⚠️ Animated and video stickers are not supported.');
-        return;
+    // Handle stickers (download first, then enqueue)
+    this.bot.on(message('sticker'), (ctx) => {
+      (async () => {
+        const sticker = ctx.message.sticker;
+        if (sticker.is_animated || sticker.is_video) {
+          await ctx.reply('⚠️ Animated and video stickers are not supported.');
+          return;
+        }
+        const filePath = await this.downloadFile(ctx, sticker.file_id, 'sticker.webp');
+        this.enqueueMessage(ctx, `Please analyze this sticker.\n\nSticker file: ${filePath}`);
+      })().catch((error) => {
+        this.logger.error('Error downloading sticker', { error, chatId: ctx.chat?.id });
+      });
+    });
+  }
+
+  /**
+   * Enqueue a message for processing
+   * Messages are processed sequentially per chat to avoid session conflicts
+   */
+  private enqueueMessage(ctx: Context, text: string): void {
+    const chatId = ctx.chat?.id;
+    if (!chatId) return;
+
+    // Create queue for this chat if it doesn't exist
+    if (!this.messageQueues.has(chatId)) {
+      this.messageQueues.set(chatId, []);
+    }
+
+    const queue = this.messageQueues.get(chatId)!;
+    const queuePosition = queue.length + (this.processingChats.has(chatId) ? 1 : 0);
+
+    // Notify user if message is queued
+    if (queuePosition > 0) {
+      ctx.reply(`⏳ Message queued (position: ${queuePosition}), please wait...`).catch(() => {});
+    }
+
+    // Add to queue with a promise that resolves when processing starts
+    const item: QueueItem = {
+      ctx,
+      text,
+      resolve: () => {},
+    };
+    queue.push(item);
+
+    this.logger.debug('Message enqueued', { chatId, queuePosition, queueLength: queue.length });
+
+    // Start processing if not already processing
+    this.processQueue(chatId);
+  }
+
+  /**
+   * Process the message queue for a chat
+   */
+  private async processQueue(chatId: number): Promise<void> {
+    // If already processing this chat, return
+    if (this.processingChats.has(chatId)) {
+      return;
+    }
+
+    const queue = this.messageQueues.get(chatId);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+
+    // Mark as processing
+    this.processingChats.add(chatId);
+
+    while (queue.length > 0) {
+      const item = queue.shift()!;
+
+      try {
+        await this.handleMessage(item.ctx, item.text);
+      } catch (error) {
+        this.logger.error('Error processing queued message', { chatId, error });
       }
-      const filePath = await this.downloadFile(ctx, sticker.file_id, 'sticker.webp');
-      await this.handleMessage(ctx, `Please analyze this sticker.\n\nSticker file: ${filePath}`);
-    });
+    }
+
+    // Done processing
+    this.processingChats.delete(chatId);
+    this.logger.debug('Queue processing complete', { chatId });
   }
 
   /**
@@ -615,8 +786,11 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       { command: 'help', description: 'Show help message' },
     ]);
 
-    // Start polling
-    await this.bot.launch();
+    // Start polling (drop pending updates and delete webhook if any)
+    await this.bot.launch({
+      dropPendingUpdates: true,
+      allowedUpdates: ['message', 'callback_query'],
+    });
     this.isRunning = true;
 
     this.logger.info('Bot started', { botName: this.config.name });

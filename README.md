@@ -11,6 +11,8 @@ A Node.js/TypeScript implementation of [tg-cc](https://github.com/eternnoir/tg-c
 - 💾 **SQLite Persistence** - Sessions are stored in SQLite for durability
 - 🔧 **Flexible Configuration** - Environment variables or .env files
 - 📦 **NPX Support** - Run directly with `npx node-tg-cc`
+- 🔐 **Permission Control** - Interactive permission confirmation for tool execution
+- 🔌 **MCP Support** - Model Context Protocol server configuration
 
 ## Requirements
 
@@ -72,6 +74,18 @@ BOT_WHITELIST=123456789,987654321
 BOT_CLAUDE_ARGS=--model claude-sonnet-4-20250514
 BOT_TEMP_DIR=/tmp/tg-cc
 
+# Model settings
+BOT_MODEL=sonnet
+BOT_MAX_TURNS=50
+
+# Permission settings
+BOT_PERMISSION_MODE=default
+BOT_PERMISSION_TIMEOUT=60
+
+# Custom prompts and MCP
+BOT_SYSTEM_PROMPT_FILE=/path/to/system-prompt.md
+BOT_MCP_CONFIG_FILE=/path/to/.mcp.json
+
 # Logging
 LOG_LEVEL=info
 LOG_FORMAT=console
@@ -108,9 +122,26 @@ BOT_2_WHITELIST=123456789,987654321
 | `BOT_WHITELIST` | Comma-separated allowed user IDs | Empty (all allowed) |
 | `BOT_CLAUDE_ARGS` | Additional Claude CLI arguments | Empty |
 | `BOT_TEMP_DIR` | Temporary directory for uploads | `{workingDir}/.tg-cc-temp` |
+| `BOT_MODEL` | Claude model to use | `sonnet` |
+| `BOT_MAX_TURNS` | Maximum conversation turns | `50` |
+| `BOT_PERMISSION_MODE` | Permission mode (see below) | `default` |
+| `BOT_PERMISSION_TIMEOUT` | Permission request timeout (seconds) | `60` |
+| `BOT_SYSTEM_PROMPT_FILE` | Path to custom system prompt file | Empty |
+| `BOT_MCP_CONFIG_FILE` | Path to MCP config file (.mcp.json) | Auto-detect |
 | `LOG_LEVEL` | Logging level | `info` |
 | `LOG_FORMAT` | Log format (`console` or `json`) | `console` |
 | `DB_PATH` | SQLite database path | `sessions.db` |
+
+### Permission Modes
+
+| Mode | Description |
+|------|-------------|
+| `default` | Requires user confirmation for all tool executions |
+| `acceptEdits` | Auto-accepts file edits, confirms other tools |
+| `bypassPermissions` | Auto-accepts all tool executions (use with caution) |
+| `plan` | Planning mode only |
+
+When using `default` or `acceptEdits` mode, the bot will send an interactive message with Allow/Deny buttons when Claude wants to execute a tool.
 
 ## Bot Commands
 
