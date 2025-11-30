@@ -730,9 +730,10 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
     let lastProgressUpdate = 0;
     let toolCount = 0;
 
-    // Send initial progress message
+    // Send initial progress message (language auto-detected from user's message)
     try {
-      const progressMsg = await ctx.reply('🔄 處理中...');
+      const initialMessage = await this.progressDescriber.getInitialMessage(text);
+      const progressMsg = await ctx.reply(`🔄 ${initialMessage}`);
       progressMessageId = progressMsg.message_id;
     } catch {
       // Ignore if we can't send progress message
