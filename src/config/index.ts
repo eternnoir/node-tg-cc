@@ -17,6 +17,10 @@ export interface BotConfig {
   claudeArgs: string[];
   /** Temporary directory for file uploads */
   tempDir: string;
+  /** Claude model to use (default: sonnet) */
+  model: string;
+  /** Maximum turns for Claude conversation */
+  maxTurns: number;
 }
 
 /**
@@ -141,6 +145,13 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
   }
   ensureDirectory(tempDir);
 
+  // Claude model (default: sonnet)
+  const model = process.env[`${prefix}_MODEL`] || 'sonnet';
+
+  // Max turns (default: 50)
+  const maxTurnsStr = process.env[`${prefix}_MAX_TURNS`];
+  const maxTurns = maxTurnsStr ? parseInt(maxTurnsStr, 10) : 50;
+
   return {
     token,
     workingDir,
@@ -148,6 +159,8 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     whitelist,
     claudeArgs,
     tempDir,
+    model,
+    maxTurns,
   };
 }
 

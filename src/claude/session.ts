@@ -30,6 +30,18 @@ export interface ClaudeResult {
 }
 
 /**
+ * Session manager options
+ */
+export interface SessionManagerOptions {
+  storage: SQLiteStorage;
+  botName: string;
+  workingDir: string;
+  model?: string;
+  maxTurns?: number;
+  claudeArgs?: string[];
+}
+
+/**
  * Session manager for Claude interactions
  */
 export class SessionManager {
@@ -38,23 +50,24 @@ export class SessionManager {
   private storage: SQLiteStorage;
   private botName: string;
   private workingDir: string;
+  private model: string;
+  private maxTurns: number;
   private claudeArgs: string[];
 
-  constructor(
-    storage: SQLiteStorage,
-    botName: string,
-    workingDir: string,
-    claudeArgs: string[] = []
-  ) {
-    this.storage = storage;
-    this.botName = botName;
-    this.workingDir = workingDir;
-    this.claudeArgs = claudeArgs;
+  constructor(options: SessionManagerOptions) {
+    this.storage = options.storage;
+    this.botName = options.botName;
+    this.workingDir = options.workingDir;
+    this.model = options.model || 'sonnet';
+    this.maxTurns = options.maxTurns || 50;
+    this.claudeArgs = options.claudeArgs || [];
 
     this.logger.info('SessionManager initialized', {
-      botName,
-      workingDir,
-      claudeArgs,
+      botName: this.botName,
+      workingDir: this.workingDir,
+      model: this.model,
+      maxTurns: this.maxTurns,
+      claudeArgs: this.claudeArgs,
     });
   }
 
@@ -180,7 +193,8 @@ export class SessionManager {
       // Build options for Claude query
       const options: Options = {
         cwd: this.workingDir,
-        maxTurns: 50,
+        model: this.model,
+        maxTurns: this.maxTurns,
         permissionMode: 'bypassPermissions',
         ...this.parseClaudeOptions(),
       };

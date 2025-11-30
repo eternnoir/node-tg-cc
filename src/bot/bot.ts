@@ -70,12 +70,14 @@ export class TelegramBot {
     this.config = config;
     this.bot = new Telegraf(config.token);
 
-    this.sessionManager = new SessionManager(
+    this.sessionManager = new SessionManager({
       storage,
-      config.name,
-      config.workingDir,
-      config.claudeArgs
-    );
+      botName: config.name,
+      workingDir: config.workingDir,
+      model: config.model,
+      maxTurns: config.maxTurns,
+      claudeArgs: config.claudeArgs,
+    });
 
     this.setupCommands();
     this.setupMessageHandler();
