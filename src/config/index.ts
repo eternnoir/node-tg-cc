@@ -36,6 +36,8 @@ export interface BotConfig {
   progressEnabled?: boolean;
   /** Custom system prompt for progress description generation */
   progressSystemPrompt?: string;
+  /** Extended thinking budget in tokens (0 = disabled, min: 1024 when enabled) */
+  thinkingBudget?: number;
 }
 
 /**
@@ -204,6 +206,11 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
   // Custom system prompt for progress descriptions (optional)
   const progressSystemPrompt = process.env[`${prefix}_PROGRESS_SYSTEM_PROMPT`];
 
+  // Extended thinking budget in tokens (0 = disabled, min: 1024 when enabled)
+  const thinkingBudgetStr = process.env[`${prefix}_THINKING_BUDGET`];
+  const thinkingBudgetRaw = thinkingBudgetStr ? parseInt(thinkingBudgetStr, 10) : 0;
+  const thinkingBudget = thinkingBudgetRaw > 0 ? Math.max(1024, thinkingBudgetRaw) : 0;
+
   return {
     token,
     workingDir,
@@ -219,6 +226,7 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     mcpConfigFile,
     progressEnabled,
     progressSystemPrompt,
+    thinkingBudget,
   };
 }
 

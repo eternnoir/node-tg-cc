@@ -13,6 +13,7 @@ A Node.js/TypeScript implementation of [tg-cc](https://github.com/eternnoir/tg-c
 - 📦 **NPX Support** - Run directly with `npx node-tg-cc`
 - 🔐 **Permission Control** - Interactive permission confirmation for tool execution
 - 🔌 **MCP Support** - Model Context Protocol server configuration
+- 🧠 **Extended Thinking** - Enable Claude's step-by-step reasoning for complex tasks
 
 ## Requirements
 
@@ -128,6 +129,7 @@ BOT_2_WHITELIST=123456789,987654321
 | `BOT_PERMISSION_TIMEOUT` | Permission request timeout (seconds) | `60` |
 | `BOT_SYSTEM_PROMPT_FILE` | Path to custom system prompt file | Empty |
 | `BOT_MCP_CONFIG_FILE` | Path to MCP config file (.mcp.json) | Auto-detect |
+| `BOT_THINKING_BUDGET` | Extended thinking token budget (0=disabled, min 1024) | `0` |
 | `LOG_LEVEL` | Logging level | `info` |
 | `LOG_FORMAT` | Log format (`console` or `json`) | `console` |
 | `DB_PATH` | SQLite database path | `sessions.db` |

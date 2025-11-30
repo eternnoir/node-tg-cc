@@ -104,4 +104,46 @@ export class ProgressDescriber {
       return `Running ${toolName}...`;
     }
   }
+
+  /**
+   * Generate a human-friendly description of what Claude is thinking about
+   */
+  async describeThinking(thinkingContent: string): Promise<string> {
+    if (!this.enabled) {
+      return 'Thinking...';
+    }
+
+    try {
+      // Truncate thinking content to avoid sending too much to Haiku
+      const truncated = thinkingContent.slice(0, 500);
+      const prompt = `Claude is thinking:\n"${truncated}"\n\nSummarize what Claude is thinking about.`;
+
+      let resultText = '';
+
+      const response = query({
+        prompt,
+        options: {
+          model: 'haiku',
+          maxTurns: 1,
+          systemPrompt: this.systemPrompt,
+          permissionMode: 'bypassPermissions',
+        },
+      });
+
+      for await (const message of response) {
+        if (message.type === 'assistant' && message.message?.content) {
+          for (const block of message.message.content) {
+            if (block.type === 'text') {
+              resultText += block.text;
+            }
+          }
+        }
+      }
+
+      return resultText.trim() || 'Thinking...';
+    } catch (error) {
+      this.logger.warn('Failed to generate thinking description', { error });
+      return 'Thinking...';
+    }
+  }
 }

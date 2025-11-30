@@ -192,6 +192,7 @@ export class TelegramBot {
       permissionTimeout: config.permissionTimeout,
       systemPromptFile: config.systemPromptFile,
       mcpConfigFile: config.mcpConfigFile,
+      thinkingBudget: config.thinkingBudget,
     });
 
     // Set up permission request callback
@@ -770,6 +771,13 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
 
           // Generate human-friendly description using Haiku
           const description = await this.progressDescriber.describe(toolName, toolInput);
+          await updateProgress(description);
+        },
+        onThinking: async (thinking) => {
+          this.logger.debug('Thinking detected', { chatId, thinkingLength: thinking.length });
+
+          // Generate human-friendly description using Haiku
+          const description = await this.progressDescriber.describeThinking(thinking);
           await updateProgress(description);
         },
       });

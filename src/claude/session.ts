@@ -66,6 +66,11 @@ export type OnToolUseCallback = (
 ) => void | Promise<void>;
 
 /**
+ * Callback for thinking progress
+ */
+export type OnThinkingCallback = (thinking: string) => void | Promise<void>;
+
+/**
  * Session manager options
  */
 export interface SessionManagerOptions {
@@ -79,6 +84,7 @@ export interface SessionManagerOptions {
   permissionTimeout?: number;
   systemPromptFile?: string;
   mcpConfigFile?: string;
+  thinkingBudget?: number;
 }
 
 /**
@@ -97,6 +103,7 @@ export class SessionManager {
   private permissionManager: PermissionManager;
   private systemPrompt?: string;
   private mcpServers?: Record<string, McpServerConfig>;
+  private thinkingBudget: number;
 
   constructor(options: SessionManagerOptions) {
     this.storage = options.storage;
@@ -107,6 +114,7 @@ export class SessionManager {
     this.claudeArgs = options.claudeArgs || [];
     this.permissionMode = options.permissionMode || 'default';
     this.permissionManager = new PermissionManager(options.permissionTimeout || 60);
+    this.thinkingBudget = options.thinkingBudget || 0;
 
     // Load system prompt from file if specified
     if (options.systemPromptFile) {
@@ -139,6 +147,7 @@ export class SessionManager {
       claudeArgs: this.claudeArgs,
       hasSystemPrompt: !!this.systemPrompt,
       hasMcpServers: !!this.mcpServers,
+      thinkingBudget: this.thinkingBudget,
     });
   }
 
@@ -292,6 +301,7 @@ export class SessionManager {
     callbacks?: {
       onProgress?: (text: string) => void;
       onToolUse?: OnToolUseCallback;
+      onThinking?: OnThinkingCallback;
     }
   ): Promise<ClaudeResult> {
     const session = this.getSession(chatId);
@@ -318,6 +328,7 @@ export class SessionManager {
         ...this.parseClaudeOptions(),
         ...(this.systemPrompt && { systemPrompt: this.systemPrompt }),
         ...(this.mcpServers && { mcpServers: this.mcpServers }),
+        ...(this.thinkingBudget > 0 && { maxThinkingTokens: this.thinkingBudget }),
       };
 
       // Add canUseTool callback if permission mode requires it
@@ -352,6 +363,12 @@ export class SessionManager {
             // Trigger the onToolUse callback if provided
             if (callbacks?.onToolUse) {
               callbacks.onToolUse(tool, input);
+            }
+          },
+          onThinking: (thinking) => {
+            // Trigger the onThinking callback if provided
+            if (callbacks?.onThinking) {
+              callbacks.onThinking(thinking);
             }
           },
           onCost: (cost) => {
@@ -398,6 +415,7 @@ export class SessionManager {
       onText: (text: string) => void;
       onSessionId: (id: string) => void;
       onToolUse: (tool: string, input: Record<string, unknown>) => void;
+      onThinking: (thinking: string) => void;
       onCost: (cost: number) => void;
     }
   ): void {
@@ -427,6 +445,10 @@ export class SessionManager {
                 // Pass tool name and input to the handler
                 const toolInput = (block as { name: string; input: Record<string, unknown> }).input || {};
                 handlers.onToolUse(block.name, toolInput);
+              } else if (block.type === 'thinking') {
+                // Pass thinking content to the handler
+                const thinkingContent = (block as { thinking: string }).thinking || '';
+                handlers.onThinking(thinkingContent);
               }
             }
           }
