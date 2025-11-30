@@ -5,9 +5,11 @@ import {
   type SDKSystemMessage,
   type SDKResultMessage,
   type Options,
-} from '@anthropic-ai/claude-code';
+} from '@anthropic-ai/claude-agent-sdk';
 import { getLogger } from '../logger';
 import { SQLiteStorage } from '../storage/sqlite';
+import { PermissionManager, type PermissionRequestCallback } from './permission';
+import { type PermissionMode } from '../config';
 
 /**
  * Claude session for a specific chat
@@ -30,6 +32,20 @@ export interface ClaudeResult {
 }
 
 /**
+ * Session manager options
+ */
+export interface SessionManagerOptions {
+  storage: SQLiteStorage;
+  botName: string;
+  workingDir: string;
+  model?: string;
+  maxTurns?: number;
+  claudeArgs?: string[];
+  permissionMode?: PermissionMode;
+  permissionTimeout?: number;
+}
+
+/**
  * Session manager for Claude interactions
  */
 export class SessionManager {
@@ -38,24 +54,44 @@ export class SessionManager {
   private storage: SQLiteStorage;
   private botName: string;
   private workingDir: string;
+  private model: string;
+  private maxTurns: number;
   private claudeArgs: string[];
+  private permissionMode: PermissionMode;
+  private permissionManager: PermissionManager;
 
-  constructor(
-    storage: SQLiteStorage,
-    botName: string,
-    workingDir: string,
-    claudeArgs: string[] = []
-  ) {
-    this.storage = storage;
-    this.botName = botName;
-    this.workingDir = workingDir;
-    this.claudeArgs = claudeArgs;
+  constructor(options: SessionManagerOptions) {
+    this.storage = options.storage;
+    this.botName = options.botName;
+    this.workingDir = options.workingDir;
+    this.model = options.model || 'sonnet';
+    this.maxTurns = options.maxTurns || 50;
+    this.claudeArgs = options.claudeArgs || [];
+    this.permissionMode = options.permissionMode || 'bypassPermissions';
+    this.permissionManager = new PermissionManager(options.permissionTimeout || 60);
 
     this.logger.info('SessionManager initialized', {
-      botName,
-      workingDir,
-      claudeArgs,
+      botName: this.botName,
+      workingDir: this.workingDir,
+      model: this.model,
+      maxTurns: this.maxTurns,
+      permissionMode: this.permissionMode,
+      claudeArgs: this.claudeArgs,
     });
+  }
+
+  /**
+   * Set the permission request callback
+   */
+  setPermissionRequestCallback(callback: PermissionRequestCallback): void {
+    this.permissionManager.setPermissionRequestCallback(callback);
+  }
+
+  /**
+   * Get the permission manager
+   */
+  getPermissionManager(): PermissionManager {
+    return this.permissionManager;
   }
 
   /**
@@ -90,6 +126,8 @@ export class SessionManager {
       session.sessionId = null;
     }
     this.storage.clearSessionId(chatId, this.botName);
+    this.permissionManager.clearAlwaysAllowed(chatId);
+    this.permissionManager.cancelPendingForChat(chatId);
     this.logger.info('Session cleared', { chatId, botName: this.botName });
   }
 
@@ -99,6 +137,8 @@ export class SessionManager {
   deleteSession(chatId: number): void {
     this.sessions.delete(chatId);
     this.storage.deleteSession(chatId, this.botName);
+    this.permissionManager.clearAlwaysAllowed(chatId);
+    this.permissionManager.cancelPendingForChat(chatId);
     this.logger.info('Session deleted', { chatId, botName: this.botName });
   }
 
@@ -155,6 +195,33 @@ export class SessionManager {
   }
 
   /**
+   * Create canUseTool callback for permission handling
+   */
+  private createCanUseTool(chatId: number): Options['canUseTool'] {
+    return async (toolName, toolInput) => {
+      this.logger.debug('Permission requested for tool', { chatId, toolName });
+
+      const response = await this.permissionManager.requestPermission(
+        chatId,
+        toolName,
+        toolInput
+      );
+
+      if (response.allowed) {
+        return {
+          behavior: 'allow' as const,
+          updatedInput: toolInput,
+        };
+      } else {
+        return {
+          behavior: 'deny' as const,
+          message: response.message || 'User denied permission',
+        };
+      }
+    };
+  }
+
+  /**
    * Send a query to Claude
    */
   async query(
@@ -180,10 +247,16 @@ export class SessionManager {
       // Build options for Claude query
       const options: Options = {
         cwd: this.workingDir,
-        maxTurns: 50,
-        permissionMode: 'bypassPermissions',
+        model: this.model,
+        maxTurns: this.maxTurns,
+        permissionMode: this.permissionMode,
         ...this.parseClaudeOptions(),
       };
+
+      // Add canUseTool callback if permission mode requires it
+      if (this.permissionMode === 'default' || this.permissionMode === 'acceptEdits') {
+        options.canUseTool = this.createCanUseTool(chatId);
+      }
 
       // Add resume option if we have a session
       if (session.sessionId) {

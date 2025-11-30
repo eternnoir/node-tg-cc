@@ -1,6 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+/** Permission mode type */
+export type PermissionMode = 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
+
 /**
  * Configuration for a single bot instance
  */
@@ -17,6 +20,14 @@ export interface BotConfig {
   claudeArgs: string[];
   /** Temporary directory for file uploads */
   tempDir: string;
+  /** Claude model to use (default: sonnet) */
+  model: string;
+  /** Maximum turns for Claude conversation */
+  maxTurns: number;
+  /** Permission mode for tool execution */
+  permissionMode: PermissionMode;
+  /** Timeout for permission requests in seconds (default: 60) */
+  permissionTimeout: number;
 }
 
 /**
@@ -141,6 +152,24 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
   }
   ensureDirectory(tempDir);
 
+  // Claude model (default: sonnet)
+  const model = process.env[`${prefix}_MODEL`] || 'sonnet';
+
+  // Max turns (default: 50)
+  const maxTurnsStr = process.env[`${prefix}_MAX_TURNS`];
+  const maxTurns = maxTurnsStr ? parseInt(maxTurnsStr, 10) : 50;
+
+  // Permission mode (default: bypassPermissions)
+  const permissionModeEnv = process.env[`${prefix}_PERMISSION_MODE`] || 'bypassPermissions';
+  const validModes: PermissionMode[] = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
+  const permissionMode: PermissionMode = validModes.includes(permissionModeEnv as PermissionMode)
+    ? (permissionModeEnv as PermissionMode)
+    : 'bypassPermissions';
+
+  // Permission timeout in seconds (default: 60)
+  const permissionTimeoutStr = process.env[`${prefix}_PERMISSION_TIMEOUT`];
+  const permissionTimeout = permissionTimeoutStr ? parseInt(permissionTimeoutStr, 10) : 60;
+
   return {
     token,
     workingDir,
@@ -148,6 +177,10 @@ function loadSingleBotConfig(prefix: string = 'BOT'): BotConfig | null {
     whitelist,
     claudeArgs,
     tempDir,
+    model,
+    maxTurns,
+    permissionMode,
+    permissionTimeout,
   };
 }
 
