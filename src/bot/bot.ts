@@ -1,4 +1,4 @@
-import { Telegraf, Context } from 'telegraf';
+import { Telegraf, Context, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -11,10 +11,91 @@ import { BotConfig } from '../config';
 const MAX_MESSAGE_LENGTH = 4096;
 
 /**
- * Escape special characters for Telegram MarkdownV2
+ * Format tool input for display
  */
-function escapeMarkdownV2(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+function formatToolInput(toolName: string, input: Record<string, unknown>): string {
+  const lines: string[] = [];
+
+  switch (toolName) {
+    case 'Bash':
+      if (input.command) {
+        lines.push(`Command: \`${String(input.command).slice(0, 200)}\``);
+        if (String(input.command).length > 200) lines.push('...(truncated)');
+      }
+      if (input.description) {
+        lines.push(`Description: ${input.description}`);
+      }
+      break;
+
+    case 'Read':
+    case 'FileRead':
+      if (input.file_path) {
+        lines.push(`File: \`${input.file_path}\``);
+      }
+      break;
+
+    case 'Write':
+    case 'FileWrite':
+      if (input.file_path) {
+        lines.push(`File: \`${input.file_path}\``);
+      }
+      if (input.content) {
+        const content = String(input.content);
+        lines.push(`Content: ${content.length} characters`);
+      }
+      break;
+
+    case 'Edit':
+    case 'FileEdit':
+      if (input.file_path) {
+        lines.push(`File: \`${input.file_path}\``);
+      }
+      if (input.old_string) {
+        const old = String(input.old_string).slice(0, 100);
+        lines.push(`Replace: \`${old}\`${String(input.old_string).length > 100 ? '...' : ''}`);
+      }
+      break;
+
+    case 'Glob':
+      if (input.pattern) {
+        lines.push(`Pattern: \`${input.pattern}\``);
+      }
+      break;
+
+    case 'Grep':
+      if (input.pattern) {
+        lines.push(`Pattern: \`${input.pattern}\``);
+      }
+      if (input.path) {
+        lines.push(`Path: \`${input.path}\``);
+      }
+      break;
+
+    case 'WebFetch':
+      if (input.url) {
+        lines.push(`URL: ${input.url}`);
+      }
+      break;
+
+    case 'WebSearch':
+      if (input.query) {
+        lines.push(`Query: ${input.query}`);
+      }
+      break;
+
+    default:
+      // Generic display for unknown tools
+      const keys = Object.keys(input).slice(0, 3);
+      for (const key of keys) {
+        const value = String(input[key]).slice(0, 100);
+        lines.push(`${key}: ${value}${String(input[key]).length > 100 ? '...' : ''}`);
+      }
+      if (Object.keys(input).length > 3) {
+        lines.push(`...and ${Object.keys(input).length - 3} more fields`);
+      }
+  }
+
+  return lines.join('\n');
 }
 
 /**
@@ -77,12 +158,127 @@ export class TelegramBot {
       model: config.model,
       maxTurns: config.maxTurns,
       claudeArgs: config.claudeArgs,
+      permissionMode: config.permissionMode,
+      permissionTimeout: config.permissionTimeout,
     });
+
+    // Set up permission request callback
+    this.sessionManager.setPermissionRequestCallback(
+      this.sendPermissionRequest.bind(this)
+    );
 
     this.setupCommands();
     this.setupMessageHandler();
+    this.setupCallbackHandler();
 
-    this.logger.info('TelegramBot initialized', { botName: config.name });
+    this.logger.info('TelegramBot initialized', {
+      botName: config.name,
+      permissionMode: config.permissionMode,
+    });
+  }
+
+  /**
+   * Send a permission request to the user
+   */
+  private async sendPermissionRequest(
+    chatId: number,
+    permissionId: string,
+    toolName: string,
+    toolInput: Record<string, unknown>
+  ): Promise<void> {
+    const formattedInput = formatToolInput(toolName, toolInput);
+
+    const message = `🔧 **Permission Request**
+
+Claude wants to execute:
+
+**Tool:** \`${toolName}\`
+${formattedInput}
+
+Do you want to allow this action?`;
+
+    const keyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('✅ Allow', `perm:allow:${permissionId}`),
+        Markup.button.callback('❌ Deny', `perm:deny:${permissionId}`),
+      ],
+      [
+        Markup.button.callback('✅ Always Allow This Tool', `perm:always:${permissionId}`),
+      ],
+    ]);
+
+    try {
+      await this.bot.telegram.sendMessage(chatId, message, {
+        parse_mode: 'Markdown',
+        ...keyboard,
+      });
+    } catch (error) {
+      // Try without markdown if it fails
+      const plainMessage = `🔧 Permission Request
+
+Claude wants to execute:
+
+Tool: ${toolName}
+${formattedInput.replace(/`/g, '')}
+
+Do you want to allow this action?`;
+
+      await this.bot.telegram.sendMessage(chatId, plainMessage, keyboard);
+    }
+  }
+
+  /**
+   * Setup callback query handler for permission responses
+   */
+  private setupCallbackHandler(): void {
+    this.bot.action(/^perm:(allow|deny|always):(.+)$/, async (ctx) => {
+      const match = ctx.match;
+      if (!match) return;
+
+      const action = match[1];
+      const permissionId = match[2];
+
+      const permissionManager = this.sessionManager.getPermissionManager();
+      const pending = permissionManager.getPendingPermission(permissionId);
+
+      if (!pending) {
+        await ctx.answerCbQuery('This permission request has expired.');
+        await ctx.editMessageText('⏰ Permission request expired or already handled.');
+        return;
+      }
+
+      let response: { allowed: boolean; alwaysAllow?: boolean; message?: string };
+      let statusMessage: string;
+
+      switch (action) {
+        case 'allow':
+          response = { allowed: true };
+          statusMessage = '✅ Permission granted';
+          break;
+        case 'always':
+          response = { allowed: true, alwaysAllow: true };
+          statusMessage = `✅ Permission granted (${pending.toolName} will be auto-allowed)`;
+          break;
+        case 'deny':
+        default:
+          response = { allowed: false, message: 'User denied permission' };
+          statusMessage = '❌ Permission denied';
+          break;
+      }
+
+      // Resolve the permission
+      const resolved = permissionManager.resolvePermission(permissionId, response);
+
+      if (resolved) {
+        await ctx.answerCbQuery(statusMessage);
+        await ctx.editMessageText(
+          `${statusMessage}\n\nTool: \`${pending.toolName}\``,
+          { parse_mode: 'Markdown' }
+        );
+      } else {
+        await ctx.answerCbQuery('Failed to process permission.');
+      }
+    });
   }
 
   /**
@@ -115,6 +311,10 @@ export class TelegramBot {
         return;
       }
 
+      const permissionInfo = this.config.permissionMode === 'bypassPermissions'
+        ? ''
+        : `\n**Permission Mode:** ${this.config.permissionMode}`;
+
       const welcomeMessage = `👋 Welcome to ${this.config.name}!
 
 This bot allows you to interact with Claude Code.
@@ -124,7 +324,7 @@ This bot allows you to interact with Claude Code.
 /new - Start a new conversation
 /clear - Clear the current session
 /status - Show session status
-/help - Show help message
+/help - Show help message${permissionInfo}
 
 Just send me a message and I'll process it with Claude Code!`;
 
@@ -138,6 +338,10 @@ Just send me a message and I'll process it with Claude Code!`;
         await ctx.reply(this.getUnauthorizedMessage());
         return;
       }
+
+      const permissionInfo = this.config.permissionMode === 'bypassPermissions'
+        ? ''
+        : `\n**Permission Mode:** ${this.config.permissionMode}\nWhen Claude needs to execute tools, you will be asked to approve each action.`;
 
       const helpMessage = `📚 **Help**
 
@@ -158,7 +362,7 @@ Simply send any text message to interact with Claude Code. You can also send:
 
 The bot will process your message and return Claude's response.
 
-**Working Directory:** \`${this.config.workingDir}\``;
+**Working Directory:** \`${this.config.workingDir}\`${permissionInfo}`;
 
       await ctx.reply(helpMessage, { parse_mode: 'Markdown' });
     });
@@ -214,6 +418,8 @@ The bot will process your message and return Claude's response.
 
 • **Bot Name:** ${this.config.name}
 • **Working Directory:** \`${status.workingDir}\`
+• **Model:** ${this.config.model}
+• **Permission Mode:** ${this.config.permissionMode}
 • **Has Active Session:** ${status.hasSession ? 'Yes ✅' : 'No ❌'}
 ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`` : ''}`;
 
