@@ -5,7 +5,7 @@ import {
   type SDKSystemMessage,
   type SDKResultMessage,
   type Options,
-} from '@anthropic-ai/claude-code';
+} from '@anthropic-ai/claude-agent-sdk';
 import { getLogger } from '../logger';
 import { SQLiteStorage } from '../storage/sqlite';
 
