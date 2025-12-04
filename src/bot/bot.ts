@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as https from 'https';
 import { getLogger } from '../logger';
 import { SessionManager } from '../claude/session';
+import { MessageStream } from '../claude/message-stream';
 import { ProgressDescriber } from '../claude/progress';
 import { SQLiteStorage } from '../storage/sqlite';
 import { BotConfig } from '../config';
@@ -13,12 +14,11 @@ import { BotConfig } from '../config';
 const MAX_MESSAGE_LENGTH = 4096;
 
 /**
- * Message queue item
+ * Active stream info per chat
  */
-interface QueueItem {
-  ctx: Context;
-  text: string;
-  resolve: () => void;
+interface ActiveStreamInfo {
+  stream: MessageStream;
+  processingPromise: Promise<void>;
 }
 
 /**
@@ -159,9 +159,8 @@ export class TelegramBot {
   private logger = getLogger();
   private isRunning = false;
 
-  // Message queue per chat to prevent concurrent processing
-  private messageQueues: Map<number, QueueItem[]> = new Map();
-  private processingChats: Set<number> = new Set();
+  // Active message streams per chat for real-time message injection
+  private activeStreams: Map<number, ActiveStreamInfo> = new Map();
 
   // Minimum interval between progress message edits (ms)
   private readonly PROGRESS_UPDATE_INTERVAL = 1500;
@@ -516,82 +515,102 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
         await ctx.reply(statusMessage, { parse_mode: 'Markdown' });
       }
     });
+
+    // /cancel command - cancel active processing
+    this.bot.command('cancel', async (ctx) => {
+      const userId = ctx.from?.id;
+      const chatId = ctx.chat?.id;
+
+      if (!userId || !this.isUserAllowed(userId)) {
+        await ctx.reply(this.getUnauthorizedMessage());
+        return;
+      }
+
+      if (chatId) {
+        const cancelled = this.cancelProcessing(chatId);
+        if (cancelled) {
+          await ctx.reply('🛑 Processing cancelled.');
+        } else {
+          await ctx.reply('ℹ️ No active processing to cancel.');
+        }
+      }
+    });
   }
 
   /**
    * Setup message handler for text and files
-   * NOTE: Handlers use message queue to ensure sequential processing per chat,
+   * NOTE: Handlers use message stream to enable real-time message injection,
    * while not blocking Telegraf polling (allowing callback_query to be received).
    */
   private setupMessageHandler(): void {
-    // Handle text messages (enqueue for sequential processing)
+    // Handle text messages (inject or start new processing)
     this.bot.on(message('text'), (ctx) => {
-      this.enqueueMessage(ctx, ctx.message.text);
+      this.injectOrStartMessage(ctx, ctx.message.text);
     });
 
-    // Handle photos (download first, then enqueue)
+    // Handle photos (download first, then inject)
     this.bot.on(message('photo'), (ctx) => {
       (async () => {
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         const filePath = await this.downloadFile(ctx, photo.file_id, 'photo.jpg');
         const caption = ctx.message.caption || 'Please analyze this image.';
-        this.enqueueMessage(ctx, `${caption}\n\nImage file: ${filePath}`);
+        this.injectOrStartMessage(ctx, `${caption}\n\nImage file: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading photo', { error, chatId: ctx.chat?.id });
       });
     });
 
-    // Handle documents (download first, then enqueue)
+    // Handle documents (download first, then inject)
     this.bot.on(message('document'), (ctx) => {
       (async () => {
         const doc = ctx.message.document;
         const fileName = doc.file_name || 'document';
         const filePath = await this.downloadFile(ctx, doc.file_id, fileName);
         const caption = ctx.message.caption || `Please analyze this file: ${fileName}`;
-        this.enqueueMessage(ctx, `${caption}\n\nFile: ${filePath}`);
+        this.injectOrStartMessage(ctx, `${caption}\n\nFile: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading document', { error, chatId: ctx.chat?.id });
       });
     });
 
-    // Handle audio (download first, then enqueue)
+    // Handle audio (download first, then inject)
     this.bot.on(message('audio'), (ctx) => {
       (async () => {
         const audio = ctx.message.audio;
         const fileName = audio.file_name || 'audio.mp3';
         const filePath = await this.downloadFile(ctx, audio.file_id, fileName);
         const caption = ctx.message.caption || 'Please analyze this audio file.';
-        this.enqueueMessage(ctx, `${caption}\n\nAudio file: ${filePath}`);
+        this.injectOrStartMessage(ctx, `${caption}\n\nAudio file: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading audio', { error, chatId: ctx.chat?.id });
       });
     });
 
-    // Handle video (download first, then enqueue)
+    // Handle video (download first, then inject)
     this.bot.on(message('video'), (ctx) => {
       (async () => {
         const video = ctx.message.video;
         const fileName = video.file_name || 'video.mp4';
         const filePath = await this.downloadFile(ctx, video.file_id, fileName);
         const caption = ctx.message.caption || 'Please analyze this video file.';
-        this.enqueueMessage(ctx, `${caption}\n\nVideo file: ${filePath}`);
+        this.injectOrStartMessage(ctx, `${caption}\n\nVideo file: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading video', { error, chatId: ctx.chat?.id });
       });
     });
 
-    // Handle voice messages (download first, then enqueue)
+    // Handle voice messages (download first, then inject)
     this.bot.on(message('voice'), (ctx) => {
       (async () => {
         const voice = ctx.message.voice;
         const filePath = await this.downloadFile(ctx, voice.file_id, 'voice.ogg');
-        this.enqueueMessage(ctx, `Please analyze this voice message.\n\nVoice file: ${filePath}`);
+        this.injectOrStartMessage(ctx, `Please analyze this voice message.\n\nVoice file: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading voice', { error, chatId: ctx.chat?.id });
       });
     });
 
-    // Handle stickers (download first, then enqueue)
+    // Handle stickers (download first, then inject)
     this.bot.on(message('sticker'), (ctx) => {
       (async () => {
         const sticker = ctx.message.sticker;
@@ -600,7 +619,7 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
           return;
         }
         const filePath = await this.downloadFile(ctx, sticker.file_id, 'sticker.webp');
-        this.enqueueMessage(ctx, `Please analyze this sticker.\n\nSticker file: ${filePath}`);
+        this.injectOrStartMessage(ctx, `Please analyze this sticker.\n\nSticker file: ${filePath}`);
       })().catch((error) => {
         this.logger.error('Error downloading sticker', { error, chatId: ctx.chat?.id });
       });
@@ -608,116 +627,89 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
   }
 
   /**
-   * Enqueue a message for processing
-   * Messages are processed sequentially per chat to avoid session conflicts
+   * Handle incoming message - inject into active stream or start new processing
    */
-  private enqueueMessage(ctx: Context, text: string): void {
+  private injectOrStartMessage(ctx: Context, text: string): void {
     const chatId = ctx.chat?.id;
+    const userId = ctx.from?.id;
+
     if (!chatId) return;
 
-    // Create queue for this chat if it doesn't exist
-    if (!this.messageQueues.has(chatId)) {
-      this.messageQueues.set(chatId, []);
-    }
-
-    const queue = this.messageQueues.get(chatId)!;
-    const queuePosition = queue.length + (this.processingChats.has(chatId) ? 1 : 0);
-
-    // Notify user if message is queued
-    if (queuePosition > 0) {
-      ctx.reply(`⏳ Message queued (position: ${queuePosition}), please wait...`).catch(() => {});
-    }
-
-    // Add to queue with a promise that resolves when processing starts
-    const item: QueueItem = {
-      ctx,
-      text,
-      resolve: () => {},
-    };
-    queue.push(item);
-
-    this.logger.debug('Message enqueued', { chatId, queuePosition, queueLength: queue.length });
-
-    // Start processing if not already processing
-    this.processQueue(chatId);
-  }
-
-  /**
-   * Process the message queue for a chat
-   */
-  private async processQueue(chatId: number): Promise<void> {
-    // If already processing this chat, return
-    if (this.processingChats.has(chatId)) {
+    // Check authorization first
+    if (!userId || !this.isUserAllowed(userId)) {
+      ctx.reply(this.getUnauthorizedMessage()).catch(() => {});
       return;
     }
 
-    const queue = this.messageQueues.get(chatId);
-    if (!queue || queue.length === 0) {
-      return;
-    }
+    // Check if there's an active stream for this chat
+    const activeInfo = this.activeStreams.get(chatId);
 
-    // Mark as processing
-    this.processingChats.add(chatId);
-
-    while (queue.length > 0) {
-      const item = queue.shift()!;
+    if (activeInfo && !activeInfo.stream.isClosed()) {
+      // Inject into existing stream
+      this.logger.info('Injecting message into active stream', {
+        chatId,
+        userId,
+        textLength: text.length,
+      });
 
       try {
-        await this.handleMessage(item.ctx, item.text);
+        activeInfo.stream.pushText(text);
+        // Send reaction to acknowledge receipt
+        ctx.react('👍').catch(() => {
+          // Fallback: some Telegram clients don't support reactions
+          this.logger.debug('Reaction not supported, skipping', { chatId });
+        });
       } catch (error) {
-        this.logger.error('Error processing queued message', { chatId, error });
+        this.logger.error('Failed to inject message', { chatId, error });
+        ctx.reply('❌ Failed to add message. Please wait for processing to complete.').catch(() => {});
       }
+    } else {
+      // Start new processing
+      this.startNewProcessing(ctx, text);
     }
-
-    // Done processing
-    this.processingChats.delete(chatId);
-    this.logger.debug('Queue processing complete', { chatId });
   }
 
   /**
-   * Download a file from Telegram
+   * Start new message processing with a fresh stream
    */
-  private async downloadFile(ctx: Context, fileId: string, fileName: string): Promise<string> {
-    const fileLink = await ctx.telegram.getFileLink(fileId);
-    const response = await fetch(fileLink.href);
-    const buffer = Buffer.from(await response.arrayBuffer());
+  private startNewProcessing(ctx: Context, text: string): void {
+    const chatId = ctx.chat?.id!;
 
-    // Create unique filename
-    const uniqueName = `${Date.now()}_${fileName}`;
-    const filePath = path.join(this.config.tempDir, uniqueName);
+    // Create new message stream
+    const stream = new MessageStream();
 
-    fs.writeFileSync(filePath, buffer);
-    this.logger.debug('File downloaded', { filePath, fileId });
+    // Push the initial message
+    stream.pushText(text);
 
-    return filePath;
+    // Start processing in background
+    const processingPromise = this.processStream(ctx, stream);
+
+    // Store active stream info
+    this.activeStreams.set(chatId, { stream, processingPromise });
+
+    // Clean up when done
+    processingPromise.finally(() => {
+      stream.close();
+      this.activeStreams.delete(chatId);
+      this.logger.debug('Stream processing complete', { chatId });
+    });
   }
 
   /**
-   * Handle a message and send it to Claude
+   * Process a message stream using Claude
    */
-  private async handleMessage(ctx: Context, text: string): Promise<void> {
-    const userId = ctx.from?.id;
-    const chatId = ctx.chat?.id;
-
-    if (!userId || !this.isUserAllowed(userId)) {
-      await ctx.reply(this.getUnauthorizedMessage());
-      return;
-    }
-
-    if (!chatId) {
-      return;
-    }
+  private async processStream(ctx: Context, stream: MessageStream): Promise<void> {
+    const chatId = ctx.chat?.id!;
+    const userId = ctx.from?.id!;
 
     // Truncate user input for logging (first 500 chars)
-    const truncatedInput = text.length > 500 ? text.slice(0, 500) + '...[truncated]' : text;
+    // Note: We don't have the initial text here, logging happens in handleMessage equivalent
 
-    this.logger.info('Processing message', {
+    this.logger.info('Starting stream processing', {
       chatId,
       userId,
       username: ctx.from?.username,
       firstName: ctx.from?.first_name,
-      textLength: text.length,
-      userInput: truncatedInput,
     });
 
     // Send typing indicator
@@ -737,9 +729,9 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
     let lastProgressUpdate = 0;
     let toolCount = 0;
 
-    // Send initial progress message (language auto-detected from user's message)
+    // Send initial progress message
     try {
-      const initialMessage = await this.progressDescriber.getInitialMessage(text);
+      const initialMessage = await this.progressDescriber.getInitialMessage('...');
       const progressMsg = await ctx.reply(`🔄 ${initialMessage}`);
       progressMessageId = progressMsg.message_id;
     } catch {
@@ -752,7 +744,7 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
 
       const now = Date.now();
       if (now - lastProgressUpdate < this.PROGRESS_UPDATE_INTERVAL) {
-        return; // Debounce - skip update if too frequent
+        return; // Debounce
       }
       lastProgressUpdate = now;
 
@@ -764,16 +756,15 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
           `🔧 ${description}`
         );
       } catch {
-        // Ignore edit errors (message not modified, etc.)
+        // Ignore edit errors
       }
     };
 
     try {
-      // Query Claude with progress callback
-      const result = await this.sessionManager.query(chatId, text, {
+      // Query Claude with the message stream
+      const result = await this.sessionManager.queryWithStream(chatId, stream, {
         onToolUse: async (toolName, toolInput) => {
           toolCount++;
-          // Log tool usage with input details (truncate large inputs)
           const inputSummary = this.summarizeToolInput(toolName, toolInput);
           this.logger.info('Tool use detected', {
             chatId,
@@ -783,12 +774,10 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
             inputSummary,
           });
 
-          // Generate human-friendly description using Haiku
           const description = await this.progressDescriber.describe(toolName, toolInput);
           await updateProgress(description);
         },
         onThinking: async (thinking) => {
-          // Log thinking content preview (first 200 chars)
           const thinkingPreview = thinking.length > 200
             ? thinking.slice(0, 200) + '...[truncated]'
             : thinking;
@@ -799,7 +788,6 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
             thinkingPreview,
           });
 
-          // Generate human-friendly description using Haiku
           const description = await this.progressDescriber.describeThinking(thinking);
           await updateProgress(description);
         },
@@ -824,12 +812,11 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
         await ctx.reply('⚠️ No response received from Claude.');
       }
 
-      // Truncate AI response for logging (first 500 chars)
+      // Log statistics
       const truncatedResponse = result.text.length > 500
         ? result.text.slice(0, 500) + '...[truncated]'
         : result.text;
 
-      // Log statistics with content preview
       this.logger.info('Response sent', {
         chatId,
         userId,
@@ -853,11 +840,42 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
         }
       }
 
-      this.logger.error('Error processing message', { chatId, error });
+      this.logger.error('Error processing stream', { chatId, error });
 
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       await ctx.reply(`❌ Error: ${errorMessage}`);
     }
+  }
+
+  /**
+   * Cancel active processing for a chat
+   */
+  cancelProcessing(chatId: number): boolean {
+    const activeInfo = this.activeStreams.get(chatId);
+    if (activeInfo && !activeInfo.stream.isClosed()) {
+      activeInfo.stream.close();
+      this.logger.info('Processing cancelled', { chatId });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Download a file from Telegram
+   */
+  private async downloadFile(ctx: Context, fileId: string, fileName: string): Promise<string> {
+    const fileLink = await ctx.telegram.getFileLink(fileId);
+    const response = await fetch(fileLink.href);
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    // Create unique filename
+    const uniqueName = `${Date.now()}_${fileName}`;
+    const filePath = path.join(this.config.tempDir, uniqueName);
+
+    fs.writeFileSync(filePath, buffer);
+    this.logger.debug('File downloaded', { filePath, fileId });
+
+    return filePath;
   }
 
   /**
@@ -922,6 +940,7 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       { command: 'start', description: 'Start the bot' },
       { command: 'new', description: 'Start a new conversation' },
       { command: 'clear', description: 'Clear the current session' },
+      { command: 'cancel', description: 'Cancel active processing' },
       { command: 'status', description: 'Show session status' },
       { command: 'help', description: 'Show help message' },
     ]);

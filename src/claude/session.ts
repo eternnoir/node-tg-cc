@@ -2,12 +2,14 @@ import * as fs from 'fs';
 import {
   query,
   type SDKMessage,
+  type SDKUserMessage,
   type SDKAssistantMessage,
   type SDKSystemMessage,
   type SDKResultMessage,
   type Options,
   type McpServerConfig,
 } from '@anthropic-ai/claude-agent-sdk';
+import { MessageStream } from './message-stream';
 import { getLogger } from '../logger';
 import { SQLiteStorage } from '../storage/sqlite';
 import { PermissionManager, type PermissionRequestCallback } from './permission';
@@ -419,6 +421,152 @@ export class SessionManager {
       };
     } catch (error) {
       this.logger.error('Query failed', { chatId, error });
+      throw error;
+    }
+  }
+
+  /**
+   * Query Claude using a message stream for real-time message injection.
+   * This allows pushing additional messages while Claude is processing.
+   */
+  async queryWithStream(
+    chatId: number,
+    stream: MessageStream,
+    callbacks?: {
+      onProgress?: (text: string) => void;
+      onToolUse?: OnToolUseCallback;
+      onThinking?: OnThinkingCallback;
+    }
+  ): Promise<ClaudeResult> {
+    const session = this.getSession(chatId);
+    const startTime = Date.now();
+
+    // Set initial session ID if resuming an existing session
+    if (session.sessionId) {
+      stream.setSessionId(session.sessionId);
+    }
+
+    this.logger.info('Starting stream query to Claude', {
+      chatId,
+      sessionId: session.sessionId,
+      model: this.model,
+      workingDir: this.workingDir,
+      permissionMode: this.permissionMode,
+      isResuming: !!session.sessionId,
+    });
+
+    try {
+      let resultText = '';
+      let newSessionId: string | null = null;
+      const toolsUsed: string[] = [];
+      let costUsd: number | undefined;
+
+      // Build options for Claude query
+      const options: Options = {
+        cwd: this.workingDir,
+        settingSources: ['project'],
+        model: this.model,
+        maxTurns: this.maxTurns,
+        permissionMode: this.permissionMode,
+        ...this.parseClaudeOptions(),
+        ...(this.systemPrompt && { systemPrompt: this.systemPrompt }),
+        ...(this.mcpServers && { mcpServers: this.mcpServers }),
+        ...(this.thinkingBudget > 0 && { maxThinkingTokens: this.thinkingBudget }),
+      };
+
+      // Add canUseTool callback if permission mode requires it
+      if (this.permissionMode === 'default' || this.permissionMode === 'acceptEdits') {
+        options.canUseTool = this.createCanUseTool(chatId);
+      }
+
+      // Add resume option if we have a session
+      if (session.sessionId) {
+        options.resume = session.sessionId;
+      }
+
+      // Execute the query with the message stream as prompt
+      const response = query({ prompt: stream, options });
+
+      // Process the stream
+      for await (const message of response) {
+        // Capture session ID from init message and update stream
+        if (message.type === 'system') {
+          const sysMsg = message as SDKSystemMessage;
+          if (sysMsg.subtype === 'init' && sysMsg.session_id) {
+            newSessionId = sysMsg.session_id;
+            stream.setSessionId(sysMsg.session_id);
+            this.logger.debug('Session ID captured from init', {
+              chatId,
+              sessionId: sysMsg.session_id,
+            });
+          }
+        }
+
+        this.processMessage(message, {
+          onText: (text) => {
+            resultText += text;
+            if (callbacks?.onProgress) {
+              callbacks.onProgress(text);
+            }
+          },
+          onSessionId: (id) => {
+            if (!newSessionId) {
+              newSessionId = id;
+              stream.setSessionId(id);
+            }
+          },
+          onToolUse: (tool, input) => {
+            if (!toolsUsed.includes(tool)) {
+              toolsUsed.push(tool);
+            }
+            if (callbacks?.onToolUse) {
+              callbacks.onToolUse(tool, input);
+            }
+          },
+          onThinking: (thinking) => {
+            if (callbacks?.onThinking) {
+              callbacks.onThinking(thinking);
+            }
+          },
+          onCost: (cost) => {
+            costUsd = cost;
+          },
+        });
+      }
+
+      // Save the session ID if we got a new one
+      if (newSessionId) {
+        this.saveSession(chatId, newSessionId);
+      }
+
+      const durationMs = Date.now() - startTime;
+
+      // Truncate result for logging
+      const truncatedResult = resultText.length > 300
+        ? resultText.slice(0, 300) + '...[truncated]'
+        : resultText;
+
+      this.logger.info('Stream query completed', {
+        chatId,
+        sessionId: newSessionId || session.sessionId,
+        resultLength: resultText.length,
+        resultPreview: truncatedResult,
+        toolsUsed,
+        toolCount: toolsUsed.length,
+        durationMs,
+        costUsd,
+        model: this.model,
+      });
+
+      return {
+        text: resultText,
+        sessionId: newSessionId || session.sessionId,
+        toolsUsed,
+        costUsd,
+        durationMs,
+      };
+    } catch (error) {
+      this.logger.error('Stream query failed', { chatId, error });
       throw error;
     }
   }
