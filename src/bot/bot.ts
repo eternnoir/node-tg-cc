@@ -708,10 +708,16 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       return;
     }
 
+    // Truncate user input for logging (first 500 chars)
+    const truncatedInput = text.length > 500 ? text.slice(0, 500) + '...[truncated]' : text;
+
     this.logger.info('Processing message', {
       chatId,
       userId,
+      username: ctx.from?.username,
+      firstName: ctx.from?.first_name,
       textLength: text.length,
+      userInput: truncatedInput,
     });
 
     // Send typing indicator
@@ -767,14 +773,31 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       const result = await this.sessionManager.query(chatId, text, {
         onToolUse: async (toolName, toolInput) => {
           toolCount++;
-          this.logger.debug('Tool use detected', { chatId, toolName, toolCount });
+          // Log tool usage with input details (truncate large inputs)
+          const inputSummary = this.summarizeToolInput(toolName, toolInput);
+          this.logger.info('Tool use detected', {
+            chatId,
+            userId,
+            toolName,
+            toolCount,
+            inputSummary,
+          });
 
           // Generate human-friendly description using Haiku
           const description = await this.progressDescriber.describe(toolName, toolInput);
           await updateProgress(description);
         },
         onThinking: async (thinking) => {
-          this.logger.debug('Thinking detected', { chatId, thinkingLength: thinking.length });
+          // Log thinking content preview (first 200 chars)
+          const thinkingPreview = thinking.length > 200
+            ? thinking.slice(0, 200) + '...[truncated]'
+            : thinking;
+          this.logger.info('Thinking detected', {
+            chatId,
+            userId,
+            thinkingLength: thinking.length,
+            thinkingPreview,
+          });
 
           // Generate human-friendly description using Haiku
           const description = await this.progressDescriber.describeThinking(thinking);
@@ -801,14 +824,22 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
         await ctx.reply('⚠️ No response received from Claude.');
       }
 
-      // Log statistics
+      // Truncate AI response for logging (first 500 chars)
+      const truncatedResponse = result.text.length > 500
+        ? result.text.slice(0, 500) + '...[truncated]'
+        : result.text;
+
+      // Log statistics with content preview
       this.logger.info('Response sent', {
         chatId,
+        userId,
         responseLength: result.text.length,
+        responsePreview: truncatedResponse,
         toolsUsed: result.toolsUsed,
         toolCount,
         durationMs: result.durationMs,
         costUsd: result.costUsd,
+        sessionId: result.sessionId,
       });
     } catch (error) {
       clearInterval(typingInterval);
@@ -827,6 +858,31 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       await ctx.reply(`❌ Error: ${errorMessage}`);
     }
+  }
+
+  /**
+   * Summarize tool input for logging (truncate large values)
+   */
+  private summarizeToolInput(toolName: string, input: Record<string, unknown>): Record<string, unknown> {
+    const summary: Record<string, unknown> = {};
+    const maxValueLength = 200;
+
+    for (const [key, value] of Object.entries(input)) {
+      if (typeof value === 'string') {
+        summary[key] = value.length > maxValueLength
+          ? value.slice(0, maxValueLength) + `...[${value.length} chars total]`
+          : value;
+      } else if (typeof value === 'object' && value !== null) {
+        const str = JSON.stringify(value);
+        summary[key] = str.length > maxValueLength
+          ? str.slice(0, maxValueLength) + `...[${str.length} chars total]`
+          : value;
+      } else {
+        summary[key] = value;
+      }
+    }
+
+    return summary;
   }
 
   /**

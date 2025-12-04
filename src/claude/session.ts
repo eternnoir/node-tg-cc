@@ -307,10 +307,18 @@ export class SessionManager {
     const session = this.getSession(chatId);
     const startTime = Date.now();
 
+    // Truncate prompt for logging (first 300 chars)
+    const truncatedPrompt = prompt.length > 300 ? prompt.slice(0, 300) + '...[truncated]' : prompt;
+
     this.logger.info('Sending query to Claude', {
       chatId,
       sessionId: session.sessionId,
       promptLength: prompt.length,
+      promptPreview: truncatedPrompt,
+      model: this.model,
+      workingDir: this.workingDir,
+      permissionMode: this.permissionMode,
+      isResuming: !!session.sessionId,
     });
 
     try {
@@ -322,6 +330,7 @@ export class SessionManager {
       // Build options for Claude query
       const options: Options = {
         cwd: this.workingDir,
+        settingSources: ['project'], // Load hooks from workingDir/.claude/settings.json
         model: this.model,
         maxTurns: this.maxTurns,
         permissionMode: this.permissionMode,
@@ -384,13 +393,21 @@ export class SessionManager {
 
       const durationMs = Date.now() - startTime;
 
+      // Truncate result for logging (first 300 chars)
+      const truncatedResult = resultText.length > 300
+        ? resultText.slice(0, 300) + '...[truncated]'
+        : resultText;
+
       this.logger.info('Query completed', {
         chatId,
         sessionId: newSessionId || session.sessionId,
         resultLength: resultText.length,
+        resultPreview: truncatedResult,
         toolsUsed,
+        toolCount: toolsUsed.length,
         durationMs,
         costUsd,
+        model: this.model,
       });
 
       return {
