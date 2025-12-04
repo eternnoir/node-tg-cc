@@ -385,6 +385,9 @@ export class SessionManager {
           onCost: (cost) => {
             costUsd = cost;
           },
+          onTurnComplete: () => {
+            // Not used for regular query (stream closes naturally)
+          },
         });
       }
 
@@ -428,6 +431,11 @@ export class SessionManager {
   /**
    * Query Claude using a message stream for real-time message injection.
    * This allows pushing additional messages while Claude is processing.
+   *
+   * IMPORTANT: The stream must be closed by the caller when done.
+   * The onTurnComplete callback fires when Claude finishes responding,
+   * allowing the caller to send the response immediately without waiting
+   * for the full query to complete.
    */
   async queryWithStream(
     chatId: number,
@@ -436,6 +444,7 @@ export class SessionManager {
       onProgress?: (text: string) => void;
       onToolUse?: OnToolUseCallback;
       onThinking?: OnThinkingCallback;
+      onTurnComplete?: (text: string, toolsUsed: string[], costUsd?: number) => void;
     }
   ): Promise<ClaudeResult> {
     const session = this.getSession(chatId);
@@ -531,6 +540,15 @@ export class SessionManager {
           onCost: (cost) => {
             costUsd = cost;
           },
+          onTurnComplete: () => {
+            // Notify caller immediately when Claude finishes responding
+            if (callbacks?.onTurnComplete && resultText) {
+              callbacks.onTurnComplete(resultText, [...toolsUsed], costUsd);
+              // Reset for next turn
+              resultText = '';
+              toolsUsed.length = 0;
+            }
+          },
         });
       }
 
@@ -582,6 +600,7 @@ export class SessionManager {
       onToolUse: (tool: string, input: Record<string, unknown>) => void;
       onThinking: (thinking: string) => void;
       onCost: (cost: number) => void;
+      onTurnComplete: () => void;
     }
   ): void {
     // Get session ID from any message
@@ -626,6 +645,8 @@ export class SessionManager {
         if (resultMsg.total_cost_usd !== undefined) {
           handlers.onCost(resultMsg.total_cost_usd);
         }
+        // Notify that this turn is complete - caller can send response immediately
+        handlers.onTurnComplete();
         break;
       }
     }

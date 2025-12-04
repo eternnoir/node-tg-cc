@@ -760,10 +760,40 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
       }
     };
 
+    // Idle timeout: close stream after response if no new messages for 30 seconds
+    const IDLE_TIMEOUT_MS = 30000;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let turnCount = 0;
+
+    const startIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        this.logger.debug('Idle timeout reached, closing stream', { chatId });
+        stream.close();
+      }, IDLE_TIMEOUT_MS);
+    };
+
+    const clearIdleTimer = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+
+    // Reset idle timer when new messages are injected
+    const originalPush = stream.pushText.bind(stream);
+    stream.pushText = (text: string) => {
+      clearIdleTimer();
+      return originalPush(text);
+    };
+
     try {
       // Query Claude with the message stream
-      const result = await this.sessionManager.queryWithStream(chatId, stream, {
+      // Note: This won't return until stream.close() is called
+      await this.sessionManager.queryWithStream(chatId, stream, {
         onToolUse: async (toolName, toolInput) => {
+          // Clear idle timer while Claude is working
+          clearIdleTimer();
           toolCount++;
           const inputSummary = this.summarizeToolInput(toolName, toolInput);
           this.logger.info('Tool use detected', {
@@ -778,6 +808,8 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
           await updateProgress(description);
         },
         onThinking: async (thinking) => {
+          // Clear idle timer while Claude is thinking
+          clearIdleTimer();
           const thinkingPreview = thinking.length > 200
             ? thinking.slice(0, 200) + '...[truncated]'
             : thinking;
@@ -791,46 +823,53 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
           const description = await this.progressDescriber.describeThinking(thinking);
           await updateProgress(description);
         },
+        onTurnComplete: async (text, toolsUsed, costUsd) => {
+          turnCount++;
+
+          // Delete progress message before sending response
+          if (progressMessageId) {
+            try {
+              await this.bot.telegram.deleteMessage(chatId, progressMessageId);
+              progressMessageId = undefined;
+            } catch {
+              // Ignore delete errors
+            }
+          }
+
+          // Send the response immediately
+          if (text) {
+            await this.sendResponse(ctx, text);
+
+            // Log statistics
+            const truncatedResponse = text.length > 500
+              ? text.slice(0, 500) + '...[truncated]'
+              : text;
+
+            this.logger.info('Response sent', {
+              chatId,
+              userId,
+              responseLength: text.length,
+              responsePreview: truncatedResponse,
+              toolsUsed,
+              toolCount,
+              costUsd,
+              turnCount,
+            });
+
+            // Reset tool count for next turn
+            toolCount = 0;
+          } else {
+            await ctx.reply('⚠️ No response received from Claude.');
+          }
+
+          // Start idle timer - stream will close if no new messages
+          startIdleTimer();
+        },
       });
 
-      // Clear typing indicator
-      clearInterval(typingInterval);
-
-      // Delete progress message before sending response
-      if (progressMessageId) {
-        try {
-          await this.bot.telegram.deleteMessage(chatId, progressMessageId);
-        } catch {
-          // Ignore delete errors
-        }
-      }
-
-      // Send the response
-      if (result.text) {
-        await this.sendResponse(ctx, result.text);
-      } else {
-        await ctx.reply('⚠️ No response received from Claude.');
-      }
-
-      // Log statistics
-      const truncatedResponse = result.text.length > 500
-        ? result.text.slice(0, 500) + '...[truncated]'
-        : result.text;
-
-      this.logger.info('Response sent', {
-        chatId,
-        userId,
-        responseLength: result.text.length,
-        responsePreview: truncatedResponse,
-        toolsUsed: result.toolsUsed,
-        toolCount,
-        durationMs: result.durationMs,
-        costUsd: result.costUsd,
-        sessionId: result.sessionId,
-      });
+      // Query completed (stream was closed)
+      this.logger.debug('Stream query completed', { chatId, turnCount });
     } catch (error) {
-      clearInterval(typingInterval);
-
       // Delete progress message on error
       if (progressMessageId) {
         try {
@@ -844,6 +883,9 @@ ${status.sessionId ? `• **Session ID:** \`${status.sessionId.slice(0, 8)}...\`
 
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       await ctx.reply(`❌ Error: ${errorMessage}`);
+    } finally {
+      clearInterval(typingInterval);
+      clearIdleTimer();
     }
   }
 
